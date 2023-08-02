@@ -171,6 +171,15 @@ form.shell > input {
     line-height: 22px;
 }
 
+.block2 {
+    position: absolute;
+    width: 350px;
+    background: white;
+    border: 1px solid #a6abbf;
+    border-radius: 3px;
+    line-height: 22px;
+}
+
 .blocks ul {
     margin: 0px;
     padding-top: 8px;

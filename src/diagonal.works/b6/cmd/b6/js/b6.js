@@ -401,7 +401,7 @@ function showFeature(feature, blocks) {
             }
         }
         d3.json("/block", request).then(response => {
-            blocks.renderBlocks(response);
+            blocks.renderBlockResponse2(response);
         });
     }
 }
@@ -542,6 +542,22 @@ class RenderedBlock {
     }
 }
 
+class TextLineRenderer {
+    getCSSClass() {
+        return "line-text";
+    }
+
+    enter(line) {}
+
+    update(line) {
+        line.text(d => d);
+    }    
+}
+
+const LineRenderers = {
+    "textLine": new TextLineRenderer(),
+}
+
 class Blocks {
     constructor(map, state, queryStyle, geojsonStyle, highlightChanged) {
         this.map = map;
@@ -566,7 +582,7 @@ class Blocks {
     }
 
     evaluateExpressionInContext(node, expression) {
-        const body = JSON.stringify({Node: node, Expression: expression});
+        const body = JSON.stringify({node: node, expression: expression});
         const request = {
             method: "POST",
             body: body,
@@ -575,7 +591,7 @@ class Blocks {
             }
         }
         d3.json("/block", request).then(response => {
-            this.renderBlocks(response);
+            this.renderBlockResponse2(response);
         });
     }
 
@@ -619,6 +635,51 @@ class Blocks {
 
     removeLayer(layer) {
         this.map.removeLayer(layer);
+    }
+
+    renderBlockResponse2(response) {
+        const root = d3.select("body").selectAll(".featured-block2").data([1]).join("div");        
+        root.attr("class", "featured-block block2");
+        root.style("left",  `${BlocksOrigin[0]}px`);
+        root.style("top", `${BlocksOrigin[1]}px`);
+        console.log(response);
+        const lineGroups = root.selectAll(".line-group").data(response.lineGroups).join("div");
+        lineGroups.attr("class", "line-group");
+        const lines = lineGroups.selectAll(".line").data(d => d.lines).join("div");
+        lines.attr("class", "line");
+        const blocks = this; // TODO: rename
+        const f = function(line) {
+            if (this.__rendered__) {
+                this.__rendered__.remove(blocks);
+                blocks.rendered = blocks.rendered.filter(r => r != this.__rendered__);
+            }
+            this.__rendered__ = new RenderedResponse(response, blocks);
+            blocks.rendered.push(this.__rendered__);
+        }
+        root.each(f);
+        this.renderLines2(lines);
+    }
+
+    renderLines2(lines) {
+        const f = function(d) {
+            // If the CSS class of the line's div matches the data bound to it, update() it,
+            // otherwise remove all child nodes and enter() the line beforehand.
+            const lineType = Object.getOwnPropertyNames(d)[0];
+            const renderer = LineRenderers[lineType];
+            if (!renderer) {
+                throw new Error(`Can't render lines of type ${lineType}`);
+            }
+            const class_ = this.getAttribute("class");
+            if (!class_ || class_.indexOf(renderer.getCSSClass()) < 0) {
+                while (this.firstChild) {
+                    this.removeChild(this.firstChild);
+                }
+                this.setAttribute("class", "line " + renderer.getCSSClass());
+                renderer.enter(d3.select(this));
+            }
+            renderer.update(d3.select(this));
+        }
+        lines.each(f);
     }
 
     renderBlocks(response) {

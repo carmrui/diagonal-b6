@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package ui;
+
+import "api.proto";
+
+option go_package = "diagonal.works/b6/proto";
+
+message BlockRequestProto {
+    api.NodeProto node = 1;
+    string expression = 2;
+}
+
+message BlockResponseProto {
+    repeated LineGroupProto lineGroups = 1;
+    api.NodeProto node = 2;
+}
+
+message LineGroupProto {
+    repeated LineProto lines = 1;
+}
+
+message LineProto {
+    oneof line {
+        TextLineProto textLine = 1;
+        FunctionLineProto functionLine = 2;
+        FeatureLineProto featureLine = 3;
+        ErrorLineProto errorLine = 4;
+    }
+}
+
+message TextLineProto {
+    string text = 1;
+}
+
+message FunctionLineProto {
+    string expression = 1;
+}
+
+message FeatureLineProto {
+    string id = 1;
+}
+
+message ErrorLineProto {
+    string error = 1;
+}
+

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -765,16 +767,324 @@ func fillMatchingFunctionSymbols(symbols []string, result interface{}, functions
 	return symbols
 }
 
-func NewBlockHandler(w ingest.MutableWorld, cores int) *BlockHandler {
+func NewBlockHandler(w ingest.MutableWorld, cores int) *BlockHandler2 {
 	local := make(api.FunctionSymbols)
 	for name, f := range functions.Functions() {
 		local[name] = f
 	}
-	return &BlockHandler{
+	return &BlockHandler2{
 		World:            w,
 		RenderRules:      renderer.BasemapRenderRules,
 		Cores:            cores,
 		FunctionSymbols:  local,
 		FunctionWrappers: functions.Wrappers(),
+	}
+}
+
+type BlockHandler2 struct {
+	World            ingest.MutableWorld
+	RenderRules      renderer.RenderRules
+	Cores            int
+	FunctionSymbols  api.FunctionSymbols
+	FunctionWrappers api.FunctionWrappers
+}
+
+func (b *BlockHandler2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	//request := BlockRequestJSON{Node: &NodeJSON{}}
+	//response := BlockResponseJSON{Node: &NodeJSON{}, Highlighted: make(FeatureIDSetJSON)}
+	request := &pb.BlockRequestProto{}
+	response := &pb.BlockResponseProto{}
+
+	if r.Method == "GET" {
+		request.Expression = r.URL.Query().Get("e")
+	} else if r.Method == "POST" {
+		var err error
+		var body []byte
+		if body, err = ioutil.ReadAll(r.Body); err == nil {
+			r.Body.Close()
+			err = protojson.Unmarshal(body, request)
+		}
+		if err != nil {
+			http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusBadRequest), err), http.StatusBadRequest)
+			return
+		}
+	} else {
+		http.Error(w, "Bad method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if request.Expression == "" && request.Node == nil {
+		http.Error(w, "No expression", http.StatusBadRequest)
+		return
+	}
+
+	if request.Expression != "" {
+		var err error
+		if request.Node == nil {
+			response.Node, err = api.ParseExpression(request.Expression)
+		} else {
+			response.Node, err = api.ParseExpressionWithLHS(request.Expression, request.Node)
+		}
+		if err != nil {
+			panic("broken")
+			//response.Blocks = fillBlocksFromError(response.Blocks, err)
+			//sendBlockResponse(&response, w)
+			//return
+		}
+	} else {
+		response.Node = request.Node
+	}
+	response.Node = api.Simplify(response.Node, b.FunctionSymbols)
+
+	group := &pb.LineGroupProto{}
+	fillLineGroupFromExpression(group, response.Node, true)
+	if len(group.Lines) > 0 {
+		response.LineGroups = append(response.LineGroups, group)
+	}
+
+	context := api.Context{
+		World:            b.World,
+		FunctionSymbols:  b.FunctionSymbols,
+		FunctionWrappers: b.FunctionWrappers,
+		Cores:            b.Cores,
+		Context:          context.Background(),
+	}
+	result, err := api.Evaluate(response.Node, &context)
+	if err == nil {
+		group := &pb.LineGroupProto{}
+		fillLineGroupFromResult(group, result, b.RenderRules, b.World)
+		if len(group.Lines) > 0 {
+			response.LineGroups = append(response.LineGroups, group)
+		}
+	} else {
+		panic("broken")
+	}
+
+	output, err := protojson.Marshal(response)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to encode response: %s", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("json: %s", output)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(output))
+}
+
+func fillLineGroupFromExpression(lines *pb.LineGroupProto, expression *pb.NodeProto, root bool) {
+	if call, ok := expression.Node.(*pb.NodeProto_Call); ok {
+		if call.Call.Pipelined {
+			left := call.Call.Args[0]
+			right := &pb.NodeProto{
+				Node: &pb.NodeProto_Call{
+					Call: &pb.CallNodeProto{
+						Function: call.Call.Function,
+						Args:     call.Call.Args[1:],
+					},
+				},
+			}
+			fillLineGroupFromExpression(lines, left, false)
+			fillLineGroupFromExpression(lines, right, false)
+			return
+		}
+	}
+	_, isLiteral := expression.Node.(*pb.NodeProto_Literal)
+	if expression, ok := api.UnparseNode(expression); ok {
+		if !isLiteral || !root {
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_FunctionLine{
+					FunctionLine: &pb.FunctionLineProto{
+						Expression: expression,
+					},
+				},
+			})
+		}
+	} else {
+		lines.Lines = append(lines.Lines, &pb.LineProto{
+			Line: &pb.LineProto_ErrorLine{
+				ErrorLine: &pb.ErrorLineProto{
+					Error: "can't convert function",
+				},
+			},
+		})
+	}
+}
+
+func fillLineGroupFromResult(lines *pb.LineGroupProto, result interface{}, rules renderer.RenderRules, w b6.World) {
+	if i, ok := api.ToInt(result); ok {
+		lines.Lines = append(lines.Lines, &pb.LineProto{
+			Line: &pb.LineProto_TextLine{
+				TextLine: &pb.TextLineProto{
+					Text: strconv.Itoa(i),
+				},
+			},
+		})
+	} else if f, ok := api.ToFloat(result); ok {
+		lines.Lines = append(lines.Lines, &pb.LineProto{
+			Line: &pb.LineProto_TextLine{
+				TextLine: &pb.TextLineProto{
+					Text: fmt.Sprintf("%f", f),
+				},
+			},
+		})
+	} else {
+		switch r := result.(type) {
+		case string:
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: r,
+					},
+				},
+			})
+		case b6.Feature:
+			//block := FeatureBlockJSON{Type: "feature"}
+			//block.Fill(r, w)
+			//response.Blocks = append(response.Blocks, block)
+			//response.Highlighted.Add(r.FeatureID())
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: fmt.Sprintf("Feature %s", r.FeatureID()),
+					},
+				},
+			})
+		case b6.Tag:
+			//response.Blocks = append(response.Blocks, StringBlockJSON{Type: "string-result", Value: api.UnparseTag(r)})
+			//if !rules.IsRendered(r) {
+			//	if q, ok := api.UnparseQuery(b6.Tagged(r)); ok {
+			//		response.QueryLayers = append(response.QueryLayers, q)
+			//	}
+			//}
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: api.UnparseTag(r),
+					},
+				},
+			})
+		case b6.Query:
+			if q, ok := api.UnparseQuery(r); ok {
+				lines.Lines = append(lines.Lines, &pb.LineProto{
+					Line: &pb.LineProto_TextLine{
+						TextLine: &pb.TextLineProto{
+							Text: q,
+						},
+					},
+				})
+			} else {
+				lines.Lines = append(lines.Lines, &pb.LineProto{
+					Line: &pb.LineProto_TextLine{
+						TextLine: &pb.TextLineProto{
+							Text: "query",
+						},
+					},
+				})
+			}
+		case api.Collection:
+			//block := CollectionBlockJSON{Type: "collection"}
+			//if err := block.Fill(r, response, w); err == nil {
+			//	response.Blocks = append(response.Blocks, block)
+			//} else {
+			//	response.Blocks = fillBlocksFromError(response.Blocks, err)
+			//}
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "collection",
+					},
+				},
+			})
+		case b6.Area:
+			//block := GeometryBlockJSON{
+			//	Type:    "area",
+			//	GeoJSON: r.ToGeoJSON(),
+			//}
+			//for i := 0; i < r.Len(); i++ {
+			//	block.Dimension += b6.AreaToMeters2(r.Polygon(i).Area())
+			//}
+			//response.Blocks = append(response.Blocks, block)
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "area",
+					},
+				},
+			})
+		case b6.Path:
+			//block := GeometryBlockJSON{
+			//	Type:      "path",
+			//	GeoJSON:   r.ToGeoJSON(),
+			//	Dimension: b6.AngleToMeters(r.Polyline().Length()),
+			//}
+			//response.Blocks = append(response.Blocks, block)
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "path",
+					},
+				},
+			})
+		case *geojson.FeatureCollection:
+			//block := GeometryBlockJSON{
+			//	Type:      "geojson-feature-collection",
+			//	GeoJSON:   r,
+			//	Dimension: float64(len(r.Features)),
+			//}
+			//response.Blocks = append(response.Blocks, block)
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "GeoJSON feature collection",
+					},
+				},
+			})
+		case *geojson.Feature:
+			//block := GeometryBlockJSON{
+			//	Type:    "geojson-feature",
+			//	GeoJSON: r,
+			//}
+			//response.Blocks = append(response.Blocks, block)
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "GeoJSON feature",
+					},
+				},
+			})
+		case *geojson.Geometry:
+			//block := GeometryBlockJSON{
+			//	Type:    "geojson-feature",
+			//	GeoJSON: geojson.NewFeatureWithGeometry(*r),
+			//}
+			//response.Blocks = append(response.Blocks, block)
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "GeoJSON geometry",
+					},
+				},
+			})
+		case b6.Point:
+			//block := PointBlockJSON{Type: "string-result", Value: pointToExpression(r.Point())}
+			//center := geojson.FromS2Point(r.Point())
+			//block.MapCenter = &center
+			//response.Blocks = append(response.Blocks, block)
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: "point",
+					},
+				},
+			})
+		default:
+			lines.Lines = append(lines.Lines, &pb.LineProto{
+				Line: &pb.LineProto_TextLine{
+					TextLine: &pb.TextLineProto{
+						Text: fmt.Sprintf("placeholder: %v", r),
+					},
+				},
+			})
+			//response.Blocks = append(response.Blocks, PlaceholderBlockJSON{Type: "placeholder", RawValue: fmt.Sprintf("%+v", r)})
+		}
 	}
 }
